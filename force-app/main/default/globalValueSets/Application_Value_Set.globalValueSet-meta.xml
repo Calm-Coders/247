@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<GlobalValueSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <customValue>
+        <fullName>247</fullName>
+        <default>false</default>
+        <label>247</label>
+    </customValue>
+    <customValue>
+        <fullName>NowAgency</fullName>
+        <default>false</default>
+        <label>NowAgency</label>
+    </customValue>
+    <masterLabel>Application_Value_Set</masterLabel>
+    <sorted>false</sorted>
+</GlobalValueSet>

@@ -1,0 +1,193 @@
+# ============================================================
+# DISABLED - This workflow is kept for reference but does not run.
+# To re-enable, uncomment the 'on:' trigger below.
+# ============================================================
+name: PR Validation (Disabled)
+
+# Disabled: no automatic validation on PR open
+# To re-enable, replace 'on: workflow_dispatch' with:
+#
+# on:
+#   pull_request:
+#     branches:
+#       - Devmain
+#       - UAT
+#       - Production
+#     types: [opened, synchronize, reopened]
+
+on:
+  workflow_dispatch:
+
+# Configuration - Update these values as needed
+env:
+  SF_API_VERSION: '64.0'
+
+jobs:
+  validate-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Determine Target Org
+        id: target-org
+        run: |
+          BASE_BRANCH="${{ github.event.pull_request.base.ref }}"
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+
+          echo "PR: $HEAD_BRANCH -> $BASE_BRANCH"
+
+          # Determine which org to deploy to based on target branch
+          case "$BASE_BRANCH" in
+            "Devmain")
+              echo "auth_url_secret=SFDX_AUTH_URL_DEV" >> $GITHUB_OUTPUT
+              echo "target_org=DEV" >> $GITHUB_OUTPUT
+              ;;
+            "UAT")
+              echo "auth_url_secret=SFDX_AUTH_URL_UAT" >> $GITHUB_OUTPUT
+              echo "target_org=UAT" >> $GITHUB_OUTPUT
+              ;;
+            "Production")
+              echo "auth_url_secret=SFDX_AUTH_URL_PROD" >> $GITHUB_OUTPUT
+              echo "target_org=PROD" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Salesforce CLI
+        run: |
+          npm install -g @salesforce/cli
+          sf --version
+
+      - name: Install sfdx-git-delta
+        run: |
+          echo "y" | sf plugins install sfdx-git-delta
+          sf plugins
+
+      - name: Authenticate to Salesforce Org
+        run: |
+          echo "${{ secrets[steps.target-org.outputs.auth_url_secret] }}" > sfdx_auth_url.txt
+          sf org login sfdx-url --sfdx-url-file sfdx_auth_url.txt --alias target-org --set-default
+          rm sfdx_auth_url.txt
+
+      - name: Generate Delta Package
+        id: delta
+        run: |
+          mkdir -p delta-package
+
+          # Get the merge base
+          BASE_SHA=$(git merge-base origin/${{ github.event.pull_request.base.ref }} ${{ github.sha }})
+          HEAD_SHA=${{ github.sha }}
+
+          echo "Generating delta between $BASE_SHA and $HEAD_SHA"
+
+          sf sgd source delta \
+            --from "$BASE_SHA" \
+            --to "$HEAD_SHA" \
+            --output-dir delta-package \
+            --ignore-file .gitignore
+
+          echo "=== Delta Package Contents ==="
+          if [ -f "delta-package/package/package.xml" ]; then
+            cat delta-package/package/package.xml
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "No metadata changes detected"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+          echo "=== Destructive Changes ==="
+          if [ -f "delta-package/destructiveChanges/destructiveChanges.xml" ]; then
+            cat delta-package/destructiveChanges/destructiveChanges.xml
+          else
+            echo "No destructive changes detected"
+          fi
+
+      - name: Determine Test Level
+        id: test-level
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+
+          if [[ "$PR_TITLE" == *"RUN_ALL_TESTS"* ]]; then
+            echo "PR title contains RUN_ALL_TESTS - will run all local tests"
+            echo "test_level=RunLocalTests" >> $GITHUB_OUTPUT
+          else
+            echo "PR title does not contain RUN_ALL_TESTS - skipping tests"
+            echo "test_level=NoTestRun" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate Deployment (Check Only)
+        if: steps.delta.outputs.has_changes == 'true'
+        run: |
+          echo "Validating deployment to ${{ steps.target-org.outputs.target_org }} org (check-only)..."
+          echo "Test Level: ${{ steps.test-level.outputs.test_level }}"
+
+          sf project deploy start \
+            --manifest delta-package/package/package.xml \
+            --target-org target-org \
+            --test-level ${{ steps.test-level.outputs.test_level }} \
+            --dry-run \
+            --ignore-warnings \
+            --api-version ${{ env.SF_API_VERSION }} \
+            --wait 120
+
+      - name: Report Validation Results
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const success = '${{ job.status }}' === 'success';
+            const hasChanges = '${{ steps.delta.outputs.has_changes }}' === 'true';
+            const targetOrg = '${{ steps.target-org.outputs.target_org }}';
+            const baseBranch = '${{ github.event.pull_request.base.ref }}';
+            const headBranch = '${{ github.event.pull_request.head.ref }}';
+            const apiVersion = '${{ env.SF_API_VERSION }}';
+            const testLevel = '${{ steps.test-level.outputs.test_level }}';
+
+            let body;
+            if (success) {
+              if (hasChanges) {
+                body = `✅ **Validation Successful**\n\n| | |\n|---|---|\n| **Source Branch** | \`${headBranch}\` |\n| **Target Branch** | \`${baseBranch}\` |\n| **Target Org** | **${targetOrg}** |\n| **API Version** | ${apiVersion} |\n| **Test Level** | ${testLevel} |\n\nThe deployment has been validated. Once this PR is approved, the changes will be deployed automatically.\n\n💡 *To run all tests, include \`RUN_ALL_TESTS\` in the PR title.*`;
+              } else {
+                body = `ℹ️ **No Metadata Changes Detected**\n\n| | |\n|---|---|\n| **Source Branch** | \`${headBranch}\` |\n| **Target Branch** | \`${baseBranch}\` |\n\nNo Salesforce metadata changes found in this PR.`;
+              }
+            } else {
+              body = `❌ **Validation Failed**\n\n| | |\n|---|---|\n| **Source Branch** | \`${headBranch}\` |\n| **Target Branch** | \`${baseBranch}\` |\n| **Target Org** | **${targetOrg}** |\n| **API Version** | ${apiVersion} |\n\nPlease check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`;
+            }
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('Validation')
+            );
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body
+              });
+            }
